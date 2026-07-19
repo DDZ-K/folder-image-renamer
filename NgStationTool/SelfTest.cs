@@ -1,0 +1,182 @@
+using NgStationTool.Services;
+
+namespace NgStationTool;
+
+/// <summary>无界面自检：图片复制 + 缓存闸门（不依赖真实键盘目标窗口）。</summary>
+internal static class SelfTest
+{
+    public static int Run()
+    {
+        Console.WriteLine("NgStationTool self-test starting...");
+        var root = Path.Combine(Path.GetTempPath(), "ng-station-selftest-" + Guid.NewGuid().ToString("N")[..8]);
+        var watch = Path.Combine(root, "watch");
+        var output = Path.Combine(root, "out");
+        var logs = Path.Combine(root, "logs");
+        var archive = Path.Combine(root, "logs_done");
+        Directory.CreateDirectory(watch);
+        Directory.CreateDirectory(output);
+        Directory.CreateDirectory(logs);
+        Directory.CreateDirectory(archive);
+
+        var cfgPath = Path.Combine(root, "config.json");
+        var cfg = new AppConfig
+        {
+            EnableImageCopy = true,
+            EnableCloudRelease = true,
+            WatchRoot = watch,
+            OutputRoot = output,
+            NgImageRoot = output,
+            CloudLogRoot = logs,
+            CloudLogArchiveRoot = archive,
+            UseDateFolders = true,
+            ReadyBudgetMs = 1000,
+            FolderSettleMs = 400,
+            BatchMaxWaitMs = 8000,
+            SizeStableIntervalMs = 50,
+            SizeStableChecks = 2,
+            RetryDelayMs = 40,
+            DebounceMs = 50,
+            PendingTimeoutSec = 30,
+            EnqueueFromImageCopyFolderName = true,
+            EnqueueFromNgImageWatch = false, // 本测只测文件夹名入队，避免输出目录二次入队干扰
+            ResultLineNumber = 2,
+            OkTokens = new List<string> { "OK" },
+            NokTokens = new List<string> { "NOK" },
+            OkKey = "NumPad9",
+            NokKey = "NumPad7",
+            AutoStartOnLaunch = false
+        };
+        cfg.Save(cfgPath);
+
+        var log = new AppLogger(Path.Combine(root, "test_log.txt"), 200);
+        var cache = new DmcPendingCache(log, cfg.PendingTimeoutSec);
+        var kb = new KeyboardService(log);
+        AppConfig live = cfg;
+        var cloud = new CloudReleaseService(log, () => live, cache, kb);
+        var img = new ImageCopyWatcher(log, () => live, (renamed, path) =>
+        {
+            cloud.EnqueueDmc(renamed, "ImageCopyRenamed", path);
+        });
+
+        var fail = 0;
+        try
+        {
+            img.Start();
+            cloud.Start();
+            Thread.Sleep(800);
+
+            // 1) 同夹写入 2 张图 → 静默后整夹一次拷贝，入 2 条 DMC
+            var dmc = "DMCTEST001";
+            var sub = Path.Combine(watch, dmc);
+            Directory.CreateDirectory(sub);
+            Thread.Sleep(200);
+            // 最小 JPEG
+            var payload = new byte[]
+            {
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+                0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9
+            };
+            var buf = new byte[256];
+            Array.Copy(payload, buf, payload.Length);
+            buf[^2] = 0xFF; buf[^1] = 0xD9;
+            var jpg = Path.Combine(sub, "cam.jpg");
+            var jpg2 = Path.Combine(sub, "cam2.jpg");
+            File.WriteAllBytes(jpg, buf);
+            Thread.Sleep(80);
+            File.WriteAllBytes(jpg2, buf);
+
+            var expected1 = dmc + "_cam";
+            var expected2 = dmc + "_cam2";
+            var deadline = DateTime.Now.AddSeconds(12);
+            var copied = 0;
+            while (DateTime.Now < deadline)
+            {
+                if (Directory.Exists(output))
+                    copied = Directory.EnumerateFiles(output, "*", SearchOption.AllDirectories)
+                        .Count(f => Path.GetFileName(f).StartsWith(dmc + "_", StringComparison.OrdinalIgnoreCase));
+                if (copied >= 2 && cache.Contains(expected1) && cache.Contains(expected2)) break;
+                Thread.Sleep(100);
+            }
+
+            if (copied < 2)
+            {
+                Console.WriteLine("FAIL: batch copy expected 2 got " + copied);
+                fail++;
+            }
+            else Console.WriteLine("PASS: batch copied 2 images");
+
+            if (!cache.Contains(expected1) || !cache.Contains(expected2))
+            {
+                Console.WriteLine("FAIL: expected 2 DMCs, cache=" +
+                    string.Join(",", cache.Snapshot().Select(x => x.Dmc)));
+                fail++;
+            }
+            else Console.WriteLine("PASS: two renamed DMCs in cache");
+
+            // 2) 无缓存时 log 应忽略
+            img.Stop();
+            cache.ForceRemove(expected1, "selftest gate");
+            cache.ForceRemove(expected2, "selftest gate");
+            Thread.Sleep(200);
+            var orphanLog = Path.Combine(logs, expected1 + ".log");
+            File.WriteAllText(orphanLog, "line1\nOK\n");
+            Thread.Sleep(1500);
+            if (cache.Contains(expected1))
+            {
+                Console.WriteLine("FAIL: orphan log must not create cache");
+                fail++;
+            }
+            else Console.WriteLine("PASS: orphan log ignored (no cache)");
+
+            // 3) 有缓存 + log（前缀+DMC）
+            var dmc2 = "DMCTEST002_cam";
+            cache.TryEnqueue(dmc2, "selftest", jpg);
+            var logPath2 = Path.Combine(logs, "prefix_" + dmc2 + ".txt");
+            File.WriteAllText(logPath2, "OK\n");
+
+            deadline = DateTime.Now.AddSeconds(6);
+            var left = true;
+            while (DateTime.Now < deadline)
+            {
+                if (!cache.Contains(dmc2)) { left = false; break; }
+                Thread.Sleep(100);
+            }
+            if (left)
+            {
+                Console.WriteLine("FAIL: DMC not removed after prefixed OK log");
+                fail++;
+            }
+            else Console.WriteLine("PASS: DMC removed after prefixed OK log");
+
+            var archived = Directory.Exists(archive) && Directory.EnumerateFiles(archive).Any(f =>
+                Path.GetFileName(f).IndexOf(dmc2, StringComparison.OrdinalIgnoreCase) >= 0);
+            if (!archived && File.Exists(logPath2))
+            {
+                Console.WriteLine("FAIL: log not archived");
+                fail++;
+            }
+            else Console.WriteLine("PASS: log archived or consumed");
+
+            // 4) 超时清除
+            cache.TryEnqueue("TIMEOUTX", "selftest", null);
+            cache.SetTimeoutSec(1);
+            Thread.Sleep(1500);
+            cache.PurgeExpired();
+            if (cache.Contains("TIMEOUTX"))
+            {
+                Console.WriteLine("FAIL: timeout purge");
+                fail++;
+            }
+            else Console.WriteLine("PASS: timeout purge");
+        }
+        finally
+        {
+            try { img.Stop(); cloud.Stop(); } catch { /* ignore */ }
+            try { img.Dispose(); cloud.Dispose(); } catch { /* ignore */ }
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
+
+        Console.WriteLine(fail == 0 ? "SELF_TEST: PASS" : $"SELF_TEST: FAIL count={fail}");
+        return fail == 0 ? 0 : 1;
+    }
+}

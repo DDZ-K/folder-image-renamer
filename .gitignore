@@ -1,0 +1,26 @@
+# Build
+**/bin/**
+**/obj/**
+**/.vs/
+*.user
+*.suo
+
+# Runtime / local
+**/station_log.txt
+**/rename_log.txt
+**/*.log
+
+# Large self-contained publish binaries (build locally or attach to Release)
+publish/*.exe
+publish/*.pdb
+publish/station_log.txt
+
+# Keep example configs and docs in publish if small
+!publish/*.bat
+!publish/*.pdf
+!publish/config.example.json
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

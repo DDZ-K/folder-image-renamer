@@ -1,0 +1,599 @@
+using System.Collections.Concurrent;
+using System.Text;
+
+namespace NgStationTool.Services;
+
+/// <summary>
+/// 1) 可选：监视 NG 图目录 → DMC 入缓存
+/// 2) 监视云端 log → 缓存有 DMC 才按键，然后出队
+/// 3) 无缓存的 log 不执行
+/// </summary>
+public sealed class CloudReleaseService : IDisposable
+{
+    private readonly AppLogger _log;
+    private readonly Func<AppConfig> _cfg;
+    private readonly DmcPendingCache _cache;
+    private readonly KeyboardService _keyboard;
+    private FileSystemWatcher? _imgWatcher;
+    private FileSystemWatcher? _logWatcher;
+    private readonly ConcurrentQueue<string> _imgQ = new();
+    private readonly ConcurrentQueue<string> _logQ = new();
+    private readonly ConcurrentDictionary<string, byte> _processedLogs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly AutoResetEvent _signal = new(false);
+    private CancellationTokenSource? _cts;
+    private Task? _worker;
+    private int _running;
+
+    public bool IsRunning => Volatile.Read(ref _running) == 1;
+    public string? LastError { get; private set; }
+
+    public CloudReleaseService(
+        AppLogger log,
+        Func<AppConfig> cfg,
+        DmcPendingCache cache,
+        KeyboardService keyboard)
+    {
+        _log = log;
+        _cfg = cfg;
+        _cache = cache;
+        _keyboard = keyboard;
+    }
+
+    public void EnqueueDmc(string dmc, string source, string? path = null)
+        => _cache.TryEnqueue(dmc, source, path);
+
+    public void Start()
+    {
+        if (IsRunning) return;
+        var cfg = _cfg();
+        if (!cfg.EnableCloudRelease)
+        {
+            _log.Info("放行", "模块已关闭（EnableCloudRelease=false）");
+            return;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(cfg.CloudLogRoot);
+            if (!string.IsNullOrWhiteSpace(cfg.CloudLogArchiveRoot))
+                Directory.CreateDirectory(cfg.CloudLogArchiveRoot);
+
+            _cts = new CancellationTokenSource();
+            _worker = Task.Factory.StartNew(() => WorkerLoop(_cts.Token), TaskCreationOptions.LongRunning);
+
+            _logWatcher = CreateWatcher(cfg.CloudLogRoot, OnLogFs, recursive: false);
+
+            var enableNgImg = cfg.EnqueueFromNgImageWatch;
+            if (enableNgImg)
+            {
+                // 禁止把输出目录当 NG 监视源：会把「已改名图」文件名整段当 DMC 再入队
+                if (IsSameOrUnder(cfg.NgImageRoot, cfg.OutputRoot) || IsSameOrUnder(cfg.OutputRoot, cfg.NgImageRoot))
+                {
+                    _log.Warn("放行",
+                        "已关闭 NG 图目录监视：NgImageRoot 与 OutputRoot 相同或互相包含，避免改名图二次入缓存。DMC 请用「复制成功→子文件夹名」入队。");
+                    enableNgImg = false;
+                }
+            }
+
+            if (enableNgImg)
+            {
+                Directory.CreateDirectory(cfg.NgImageRoot);
+                _imgWatcher = CreateWatcher(cfg.NgImageRoot, OnImgFs, recursive: true);
+            }
+
+            Volatile.Write(ref _running, 1);
+            LastError = null;
+            _log.Success("放行",
+                $"运行中 log={cfg.CloudLogRoot} ngImg={(enableNgImg ? cfg.NgImageRoot : "关闭")} copyEnqueue={cfg.EnqueueFromImageCopyFolderName} 超时={cfg.PendingTimeoutSec}s");
+        }
+        catch (Exception ex)
+        {
+            LastError = ex.Message;
+            _log.Error("放行", "启动失败: " + ex.Message);
+            Stop();
+        }
+    }
+
+    public void Stop()
+    {
+        Volatile.Write(ref _running, 0);
+        DisposeWatcher(ref _logWatcher, OnLogFs);
+        DisposeWatcher(ref _imgWatcher, OnImgFs);
+        try { _cts?.Cancel(); } catch { /* ignore */ }
+        try { _signal.Set(); } catch { /* ignore */ }
+        try { _worker?.Wait(2000); } catch { /* ignore */ }
+        _cts?.Dispose();
+        _cts = null;
+        _worker = null;
+        _log.Info("放行", "已停止");
+    }
+
+    private FileSystemWatcher CreateWatcher(string root, FileSystemEventHandler handler, bool recursive)
+    {
+        var w = new FileSystemWatcher(root)
+        {
+            IncludeSubdirectories = recursive,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime,
+            InternalBufferSize = 64 * 1024
+        };
+        w.Created += handler;
+        w.Changed += handler;
+        w.Renamed += (_, e) => handler(w, new FileSystemEventArgs(WatcherChangeTypes.Created, Path.GetDirectoryName(e.FullPath) ?? root, e.Name ?? Path.GetFileName(e.FullPath)));
+        w.Error += (_, e) =>
+        {
+            _log.Error("放行", "Watcher 错误: " + (e.GetException()?.Message ?? "") + "，重建");
+            try { Stop(); Thread.Sleep(500); Start(); } catch (Exception ex) { _log.Error("放行", ex.Message); }
+        };
+        w.EnableRaisingEvents = true;
+        return w;
+    }
+
+    private void DisposeWatcher(ref FileSystemWatcher? w, FileSystemEventHandler handler)
+    {
+        try
+        {
+            if (w == null) return;
+            w.EnableRaisingEvents = false;
+            w.Created -= handler;
+            w.Changed -= handler;
+            w.Dispose();
+            w = null;
+        }
+        catch { /* ignore */ }
+    }
+
+    private void OnImgFs(object sender, FileSystemEventArgs e)
+    {
+        try
+        {
+            if (File.Exists(e.FullPath))
+            {
+                _imgQ.Enqueue(e.FullPath);
+                _signal.Set();
+            }
+        }
+        catch { /* ignore */ }
+    }
+
+    private void OnLogFs(object sender, FileSystemEventArgs e)
+    {
+        try
+        {
+            if (File.Exists(e.FullPath))
+            {
+                _logQ.Enqueue(e.FullPath);
+                _signal.Set();
+            }
+        }
+        catch { /* ignore */ }
+    }
+
+    private void WorkerLoop(CancellationToken token)
+    {
+        var lastPurge = Environment.TickCount64;
+        var lastScan = Environment.TickCount64;
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                // 超时清缓存 → 匹配到的 log 也归档（不按键）
+                if (Environment.TickCount64 - lastPurge > 1000)
+                {
+                    lastPurge = Environment.TickCount64;
+                    var timedOut = _cache.PurgeExpired();
+                    foreach (var dmc in timedOut)
+                    {
+                        try { ArchiveLogsContainingDmc(dmc, "timeout"); }
+                        catch (Exception ex) { _log.Warn("放行", $"超时归档 log 失败 DMC={dmc}: {ex.Message}"); }
+                    }
+                }
+
+                // 有待确认 DMC 时周期性扫 log 目录（文件名可能是「前缀+DMC」；也防漏事件）
+                if (_cache.Count > 0 && Environment.TickCount64 - lastScan > 800)
+                {
+                    lastScan = Environment.TickCount64;
+                    try { ScanLogDirForPending(); } catch (Exception ex) { _log.Warn("放行", "扫 log 目录: " + ex.Message); }
+                }
+
+                while (_imgQ.TryDequeue(out var img))
+                {
+                    if (token.IsCancellationRequested) break;
+                    try { HandleNgImage(img); } catch (Exception ex) { _log.Error("放行", "NG图: " + ex.Message); }
+                }
+
+                while (_logQ.TryDequeue(out var logPath))
+                {
+                    if (token.IsCancellationRequested) break;
+                    try { HandleLog(logPath); } catch (Exception ex) { _log.Error("放行", "Log: " + ex.Message); }
+                }
+
+                _signal.WaitOne(400);
+            }
+            catch (Exception ex)
+            {
+                _log.Error("放行", "工作线程: " + ex.Message);
+                Thread.Sleep(200);
+            }
+        }
+    }
+
+    private void ScanLogDirForPending()
+    {
+        var cfg = _cfg();
+        if (!Directory.Exists(cfg.CloudLogRoot)) return;
+        foreach (var f in Directory.EnumerateFiles(cfg.CloudLogRoot))
+        {
+            try
+            {
+                if (!cfg.LogExtSet().Contains(Path.GetExtension(f))) continue;
+                if (!string.IsNullOrWhiteSpace(cfg.CloudLogArchiveRoot) && IsUnder(cfg.CloudLogArchiveRoot, f)) continue;
+                var fullKey = Path.GetFullPath(f);
+                if (_processedLogs.ContainsKey(fullKey)) continue;
+                // 文件名是否包含任一待确认 DMC
+                if (FindPendingDmcContainedInFileName(f) == null) continue;
+                _logQ.Enqueue(f);
+            }
+            catch { /* next */ }
+        }
+        _signal.Set();
+    }
+
+    private void HandleNgImage(string path)
+    {
+        var cfg = _cfg();
+        if (!cfg.EnqueueFromNgImageWatch) return;
+        if (!File.Exists(path)) return;
+        if (!cfg.ImageExtSet().Contains(Path.GetExtension(path))) return;
+
+        var ready = FileReady.WaitReady(
+            path,
+            cfg.ReadyBudgetMs,
+            cfg.SizeStableChecks,
+            cfg.SizeStableIntervalMs,
+            cfg.RetryDelayMs,
+            cfg.MaxRetries,
+            cfg.MinImageBytes,
+            requireImageMagic: true);
+        if (!ready.Ok) return;
+
+        var dmc = ExtractDmcFromImage(cfg, path);
+        if (string.IsNullOrEmpty(dmc)) return;
+        _cache.TryEnqueue(dmc, "NgImage", path);
+    }
+
+    private void HandleLog(string path)
+    {
+        var cfg = _cfg();
+        if (!File.Exists(path)) return;
+
+        var ext = Path.GetExtension(path);
+        if (!cfg.LogExtSet().Contains(ext)) return;
+
+        if (path.EndsWith(".done", StringComparison.OrdinalIgnoreCase)) return;
+        if (!string.IsNullOrWhiteSpace(cfg.CloudLogArchiveRoot)
+            && IsUnder(cfg.CloudLogArchiveRoot, path)) return;
+
+        var fullKey = Path.GetFullPath(path);
+        if (_processedLogs.ContainsKey(fullKey)) return;
+
+        var ready = FileReady.WaitReady(
+            path,
+            cfg.LogReadyBudgetMs,
+            sizeStableChecks: 2,
+            sizeStableIntervalMs: 100,
+            retryDelayMs: 100,
+            maxRetries: 20,
+            minBytes: 1,
+            requireImageMagic: false);
+        if (!ready.Ok) return;
+
+        string text;
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            text = sr.ReadToEnd();
+        }
+        catch
+        {
+            return; // 下次再试
+        }
+
+        // ★ 文件名包含缓存中的 DMC（支持 前缀_DMC / 任意包含）
+        var dmc = FindPendingDmcContainedInFileName(path);
+        if (string.IsNullOrEmpty(dmc))
+        {
+            // 无待确认匹配：不标记 processed，等以后有缓存再扫
+            _log.Skip("放行", $"log 文件名未包含任何待确认 DMC，暂忽略: {Path.GetFileName(path)}");
+            return;
+        }
+
+        if (!TryExtractDecision(text, cfg, out var token, out var decision, out var parseNote))
+        {
+            _log.Warn("放行", $"结果未就绪/未识别 ({parseNote}) DMC={dmc} | {path}");
+            // 不标记 processed，内容可能还在写
+            return;
+        }
+
+        var keyName = decision == "OK" ? cfg.OkKey : cfg.NokKey;
+        _log.Info("放行", $"命中 DMC={dmc} 结果={decision} token={token} log={Path.GetFileName(path)} → {keyName}");
+
+        var okPress = _keyboard.SendKey(
+            keyName,
+            cfg.KeyRepeatCount,
+            cfg.KeyPressDelayMs,
+            string.IsNullOrWhiteSpace(cfg.TargetWindowTitleContains) ? null : cfg.TargetWindowTitleContains,
+            string.IsNullOrWhiteSpace(cfg.TargetProcessName) ? null : cfg.TargetProcessName,
+            cfg.ActivateWindowDelayMs);
+
+        if (!okPress)
+        {
+            _log.Error("放行", $"按键失败，保留缓存 DMC={dmc} 以便重试");
+            return;
+        }
+
+        _cache.TryRemove(dmc, out _);
+        _log.Success("放行", $"完成 DMC={dmc} {decision}，已移出缓存并归档 log");
+        _processedLogs[fullKey] = 1;
+        ArchiveLog(cfg, path, reason: decision);
+    }
+
+    /// <summary>
+    /// 在待确认池中找「被 log 文件名包含」的 DMC；多命中时取最长匹配，降低短串误匹配。
+    /// </summary>
+    private string? FindPendingDmcContainedInFileName(string logPath)
+    {
+        var name = Path.GetFileNameWithoutExtension(logPath) ?? "";
+        if (string.IsNullOrEmpty(name)) return null;
+
+        string? best = null;
+        foreach (var item in _cache.Snapshot())
+        {
+            var d = item.Dmc?.Trim();
+            if (string.IsNullOrEmpty(d)) continue;
+            if (name.IndexOf(d, StringComparison.OrdinalIgnoreCase) < 0) continue;
+            if (best == null || d.Length > best.Length)
+                best = d;
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// 解析 OK/NOK：
+    /// 1) 优先配置行号（若存在且非空）
+    /// 2) 否则最后一行非空
+    /// 3) 再否则任意行等于 OK/NOK 词表
+    /// </summary>
+    private static bool TryExtractDecision(
+        string text,
+        AppConfig cfg,
+        out string token,
+        out string decision,
+        out string note)
+    {
+        token = "";
+        decision = "";
+        note = "";
+        var rawLines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+        var cmp = cfg.ResultMatchIgnoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+        string? MatchToken(string t)
+        {
+            t = (t ?? "").Trim();
+            if (t.Length == 0) return null;
+            // 允许行内只有 OK / NOK，或带空白
+            foreach (var ok in cfg.OkTokens)
+            {
+                var o = ok.Trim();
+                if (o.Length == 0) continue;
+                if (string.Equals(t, o, cmp)) return "OK";
+                // 行内容就是词，或词单独成段
+            }
+            foreach (var nok in cfg.NokTokens)
+            {
+                var n = nok.Trim();
+                if (n.Length == 0) continue;
+                if (string.Equals(t, n, cmp)) return "NOK";
+            }
+            return null;
+        }
+
+        // 1) 配置行
+        var lineIdx = Math.Max(1, cfg.ResultLineNumber) - 1;
+        if (rawLines.Length > lineIdx)
+        {
+            var t = (rawLines[lineIdx] ?? "").Trim();
+            var d = MatchToken(t);
+            if (d != null)
+            {
+                token = t;
+                decision = d;
+                note = $"line#{cfg.ResultLineNumber}";
+                return true;
+            }
+        }
+
+        // 2) 最后非空行
+        for (var i = rawLines.Length - 1; i >= 0; i--)
+        {
+            var t = (rawLines[i] ?? "").Trim();
+            if (t.Length == 0) continue;
+            var d = MatchToken(t);
+            if (d != null)
+            {
+                token = t;
+                decision = d;
+                note = $"lastNonEmpty#{i + 1}";
+                return true;
+            }
+            break; // 最后非空行不是结果词则继续扫全部
+        }
+
+        // 3) 任意行
+        for (var i = 0; i < rawLines.Length; i++)
+        {
+            var t = (rawLines[i] ?? "").Trim();
+            var d = MatchToken(t);
+            if (d != null)
+            {
+                token = t;
+                decision = d;
+                note = $"anyLine#{i + 1}";
+                return true;
+            }
+        }
+
+        note = rawLines.Length < cfg.ResultLineNumber
+            ? $"行数不足(需第{cfg.ResultLineNumber}行，实际{rawLines.Length})"
+            : "未匹配 OK/NOK 词表";
+        return false;
+    }
+
+    private void ArchiveLogsContainingDmc(string dmc, string reason)
+    {
+        var cfg = _cfg();
+        if (string.IsNullOrWhiteSpace(dmc) || !Directory.Exists(cfg.CloudLogRoot))
+        {
+            if (string.Equals(reason, "timeout", StringComparison.OrdinalIgnoreCase))
+                WriteTimeoutPlaceholder(cfg, dmc, "log目录不存在或DMC为空");
+            return;
+        }
+
+        var matched = 0;
+        foreach (var f in Directory.EnumerateFiles(cfg.CloudLogRoot))
+        {
+            try
+            {
+                if (!cfg.LogExtSet().Contains(Path.GetExtension(f))) continue;
+                if (!string.IsNullOrWhiteSpace(cfg.CloudLogArchiveRoot) && IsUnder(cfg.CloudLogArchiveRoot, f)) continue;
+                var name = Path.GetFileNameWithoutExtension(f) ?? "";
+                if (name.IndexOf(dmc, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                ArchiveLog(cfg, f, reason);
+                matched++;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("放行", $"归档匹配 log 失败 {f}: {ex.Message}");
+            }
+        }
+
+        if (matched == 0 && string.Equals(reason, "timeout", StringComparison.OrdinalIgnoreCase))
+        {
+            // 超时且从未等到云端 log：仍写一条归档占位，方便追溯
+            WriteTimeoutPlaceholder(cfg, dmc, "等待超时且log目录内无匹配文件");
+        }
+        else if (matched > 0)
+        {
+            _log.Info("放行", $"超时归档：DMC={dmc} 共移动 {matched} 个 log");
+        }
+    }
+
+    /// <summary>超时且无云端 log 时，在归档目录写占位文件，避免「完成了但归档夹什么都没有」。</summary>
+    private void WriteTimeoutPlaceholder(AppConfig cfg, string dmc, string detail)
+    {
+        try
+        {
+            var archiveRoot = string.IsNullOrWhiteSpace(cfg.CloudLogArchiveRoot)
+                ? cfg.CloudLogRoot
+                : cfg.CloudLogArchiveRoot;
+            if (string.IsNullOrWhiteSpace(archiveRoot))
+            {
+                _log.Warn("放行", $"超时占位无法写入：归档目录为空 DMC={dmc}");
+                return;
+            }
+            Directory.CreateDirectory(archiveRoot);
+
+            // 文件名尽量避开非法字符
+            var safe = string.Join("_", (dmc ?? "unknown").Split(Path.GetInvalidFileNameChars(), StringSplitOptions.RemoveEmptyEntries));
+            if (string.IsNullOrWhiteSpace(safe)) safe = "unknown";
+            var name = $"{safe}__timeout.txt";
+            var path = Path.Combine(archiveRoot, name);
+            if (File.Exists(path))
+                path = Path.Combine(archiveRoot, $"{safe}__timeout_{DateTime.Now:HHmmssfff}.txt");
+
+            var body =
+                "result=TIMEOUT\n" +
+                $"dmc={dmc}\n" +
+                $"time={DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}\n" +
+                $"detail={detail}\n" +
+                "note=缓存等待云端log超时，未按键；本文件为占位归档记录\n";
+            File.WriteAllText(path, body, Encoding.UTF8);
+            _log.Info("放行", $"超时占位已写入归档 → {path}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("放行", $"写超时占位失败 DMC={dmc}: {ex.Message}");
+        }
+    }
+
+    private void ArchiveLog(AppConfig cfg, string path, string reason = "done")
+    {
+        try
+        {
+            if (!File.Exists(path)) return;
+            var fullKey = Path.GetFullPath(path);
+            _processedLogs[fullKey] = 1;
+
+            if (!string.IsNullOrWhiteSpace(cfg.CloudLogArchiveRoot))
+            {
+                Directory.CreateDirectory(cfg.CloudLogArchiveRoot);
+                // 归档名带原因，便于区分 OK / NOK / timeout
+                var baseName = Path.GetFileNameWithoutExtension(path);
+                var ext = Path.GetExtension(path);
+                var destName = $"{baseName}__{reason}{ext}";
+                var dest = Path.Combine(cfg.CloudLogArchiveRoot, destName);
+                if (File.Exists(dest))
+                    dest = Path.Combine(cfg.CloudLogArchiveRoot,
+                        $"{baseName}__{reason}_{DateTime.Now:HHmmssfff}{ext}");
+                File.Move(path, dest);
+                _log.Info("放行", $"log 已归档({reason}) → {dest}");
+            }
+            else
+            {
+                var done = path + $".{reason}.done";
+                if (File.Exists(done)) File.Delete(done);
+                File.Move(path, done);
+                _log.Info("放行", $"log 已标记完成({reason}) → {done}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("放行", "归档 log 失败: " + ex.Message);
+        }
+    }
+
+    private static string ExtractDmcFromImage(AppConfig cfg, string path)
+    {
+        if (string.Equals(cfg.DmcFromImage, "ParentFolder", StringComparison.OrdinalIgnoreCase))
+        {
+            var dir = Path.GetDirectoryName(path);
+            return dir == null ? "" : Path.GetFileName(dir.TrimEnd('\\', '/'));
+        }
+        return Path.GetFileNameWithoutExtension(path);
+    }
+
+    private static bool IsUnder(string root, string path)
+    {
+        try
+        {
+            var r = Path.GetFullPath(root).TrimEnd('\\', '/') + Path.DirectorySeparatorChar;
+            var p = Path.GetFullPath(path);
+            return p.StartsWith(r, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    private static bool IsSameOrUnder(string a, string b)
+    {
+        try
+        {
+            var fa = Path.GetFullPath(a).TrimEnd('\\', '/');
+            var fb = Path.GetFullPath(b).TrimEnd('\\', '/');
+            if (fa.Equals(fb, StringComparison.OrdinalIgnoreCase)) return true;
+            return IsUnder(a, b) || IsUnder(b, a);
+        }
+        catch { return true; }
+    }
+
+    public void Dispose() => Stop();
+}
