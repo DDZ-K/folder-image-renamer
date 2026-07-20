@@ -25,3 +25,6 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 publish/config.json
+
+# local packaging (use GitHub Releases for binaries)
+_release_stage/
