@@ -40,7 +40,7 @@ public sealed class KeyboardService
                     Thread.Sleep(delayMs);
             }
 
-            _log.Success("键盘", $"已发送 {label} x{Math.Max(1, repeat)}");
+            _log.Success("键盘", $"已发送 {label} x{Math.Max(1, repeat)}（含扫描码）");
             return true;
         }
         catch (Exception ex)
@@ -145,15 +145,73 @@ public sealed class KeyboardService
 
     private static bool SendVk(ushort vk)
     {
+        // 物理小键盘有扫描码（如 NumPad9→Scan=0x49）；原先 wScan=0 会导致部分工位软件不认
+        var scan = (ushort)MapVirtualKey(vk, MAPVK_VK_TO_VSC);
+        if (scan == 0)
+            scan = FallbackScan(vk);
+
+        var ext = NeedsExtendedFlag(vk) ? KEYEVENTF_EXTENDEDKEY : 0u;
+
         var inputs = new INPUT[2];
         inputs[0].type = 1; // INPUT_KEYBOARD
-        inputs[0].U.ki = new KEYBDINPUT { wVk = vk, dwFlags = 0 };
+        inputs[0].U.ki = new KEYBDINPUT
+        {
+            wVk = vk,
+            wScan = scan,
+            dwFlags = ext,
+            time = 0,
+            dwExtraInfo = IntPtr.Zero
+        };
         inputs[1].type = 1;
-        inputs[1].U.ki = new KEYBDINPUT { wVk = vk, dwFlags = 2 }; // KEYEVENTF_KEYUP
+        inputs[1].U.ki = new KEYBDINPUT
+        {
+            wVk = vk,
+            wScan = scan,
+            dwFlags = KEYEVENTF_KEYUP | ext,
+            time = 0,
+            dwExtraInfo = IntPtr.Zero
+        };
         var size = Marshal.SizeOf<INPUT>();
         var sent = SendInput(2, inputs, size);
         return sent == 2;
     }
+
+    /// <summary>导航键等需 EXTENDED 标志，更接近真实硬件。</summary>
+    private static bool NeedsExtendedFlag(ushort vk) => vk switch
+    {
+        0x21 or 0x22 or 0x23 or 0x24 => true, // PgUp PgDn End Home（主键盘区）
+        0x25 or 0x26 or 0x27 or 0x28 => true, // arrows
+        0x2D or 0x2E => true, // Insert Delete
+        0x6F => true, // NumPad /
+        0x0D => false, // Enter 主区不扩展；小键盘 Enter 才是扩展，我们映射的是主 Enter
+        _ => false
+    };
+
+    /// <summary>MapVirtualKey 失败时的硬编码扫描码（与常见 PC 扫描码一致）。</summary>
+    private static ushort FallbackScan(ushort vk) => vk switch
+    {
+        0x60 => 0x52, // NumPad0
+        0x61 => 0x4F, // NumPad1
+        0x62 => 0x50, // NumPad2
+        0x63 => 0x51, // NumPad3
+        0x64 => 0x4B, // NumPad4
+        0x65 => 0x4C, // NumPad5
+        0x66 => 0x4D, // NumPad6
+        0x67 => 0x47, // NumPad7  （KeyMonitor 物理也是 0x47）
+        0x68 => 0x48, // NumPad8
+        0x69 => 0x49, // NumPad9  （KeyMonitor 物理是 0x49）
+        0x0D => 0x1C, // Enter
+        0x21 => 0x49, // PageUp
+        0x24 => 0x47, // Home
+        _ => 0
+    };
+
+    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+    private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const uint MAPVK_VK_TO_VSC = 0x00;
+
+    [DllImport("user32.dll")]
+    private static extern uint MapVirtualKey(uint uCode, uint uMapType);
 
     private bool ActivateTarget(string? titleContains, string? processName)
     {
