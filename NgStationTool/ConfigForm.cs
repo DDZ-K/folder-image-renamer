@@ -17,6 +17,8 @@ public sealed class ConfigForm : Form
     private readonly ComboBox _dateStyle;
     private readonly CheckBox _onlyDirect;
     private readonly CheckBox _skipSameSize;
+    private readonly CheckBox _appendDate;
+    private readonly TextBox _fileNameDateFmt;
     private readonly TextBox _imageExts;
 
     // 云端 log 放行
@@ -131,6 +133,9 @@ public sealed class ConfigForm : Form
             string.Equals(cfg.DateFolderStyle, "dash", StringComparison.OrdinalIgnoreCase) ? "dash" : "ymd");
         _onlyDirect = AddCheck(p1, ref y, "仅处理一级子目录内的直接图片（推荐开）", cfg.OnlyDirectImages);
         _skipSameSize = AddCheck(p1, ref y, "目标已存在且同大小则跳过（防重复拷）", cfg.SkipIfSameSizeExists);
+        _appendDate = AddCheck(p1, ref y, "改名时在文件名末尾追加日期（扩展名前，如 _20260724）", cfg.AppendDateToFileName);
+        AddLabel(p1, ref y, "文件名日期格式 FileNameDateFormat（默认 yyyyMMdd）");
+        _fileNameDateFmt = AddTb(p1, ref y, string.IsNullOrWhiteSpace(cfg.FileNameDateFormat) ? "yyyyMMdd" : cfg.FileNameDateFormat);
         AddNote(p1, ref y, "改名规则：子文件夹名_原文件名 → 例如 ABC\\cam.jpg → ABC_cam.jpg");
         tabImage.Controls.Add(p1);
 
@@ -401,6 +406,8 @@ public sealed class ConfigForm : Form
         src.DateFolderStyle = _dateStyle.SelectedItem?.ToString() ?? "ymd";
         src.OnlyDirectImages = _onlyDirect.Checked;
         src.SkipIfSameSizeExists = _skipSameSize.Checked;
+        src.AppendDateToFileName = _appendDate.Checked;
+        src.FileNameDateFormat = string.IsNullOrWhiteSpace(_fileNameDateFmt.Text) ? "yyyyMMdd" : _fileNameDateFmt.Text.Trim();
 
         // 云端
         src.EnableCloudRelease = _enableCloud.Checked;

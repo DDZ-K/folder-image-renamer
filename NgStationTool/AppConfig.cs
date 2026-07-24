@@ -35,6 +35,10 @@ public sealed class AppConfig
     public string DateFolderFrom { get; set; } = "Now";
     /// <summary>ymd = 年\月\日；dash = 2026-07-19 单层</summary>
     public string DateFolderStyle { get; set; } = "ymd";
+    /// <summary>改名时是否在文件名末尾（扩展名前）追加日期。</summary>
+    public bool AppendDateToFileName { get; set; } = true;
+    /// <summary>追加日期格式，默认 yyyyMMdd → 20260724。</summary>
+    public string FileNameDateFormat { get; set; } = "yyyyMMdd";
 
     // ---- 云端放行 / DMC 缓存 ----
     /// <summary>NG 图监视目录。文件名（去扩展名）默认即 DMC。可与 OutputRoot 相同或单独 NG 目录。</summary>

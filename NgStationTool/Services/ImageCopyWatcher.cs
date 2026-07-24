@@ -360,7 +360,7 @@ public sealed class ImageCopyWatcher : IDisposable
                 {
                     if (!File.Exists(item.path)) continue;
                     if (IsSameWriteAlreadyHandled(item.path)) continue;
-                    var targetName = folderName + "_" + Path.GetFileName(item.path);
+                    var targetName = BuildRenamedFileName(cfg, folderName, item.path);
                     _staged.Enqueue(new StagedFile
                     {
                         SourcePath = item.path,
@@ -415,7 +415,7 @@ public sealed class ImageCopyWatcher : IDisposable
                     continue;
                 }
 
-                var targetName = folderName + "_" + Path.GetFileName(path);
+                var targetName = BuildRenamedFileName(cfg, folderName, path);
                 if (!TryCopyOne(cfg, path, item.length, item.readyMs, folderName, dayDir, targetName, out var outPath, out var stem))
                     continue;
 
@@ -548,6 +548,30 @@ public sealed class ImageCopyWatcher : IDisposable
                 DayHint = DateTime.Now
             });
         }
+    }
+
+    /// <summary>
+    /// 改名：{文件夹}_{原文件名无扩展}[_{yyyyMMdd}].{扩展名}
+    /// 例：LotA_cam1.jpg → LotA_cam1_20260724.jpg；DMC 为无扩展名全串。
+    /// </summary>
+    private static string BuildRenamedFileName(AppConfig cfg, string folderName, string sourcePath)
+    {
+        var original = Path.GetFileName(sourcePath) ?? "image.bin";
+        var stem = Path.GetFileNameWithoutExtension(original);
+        var ext = Path.GetExtension(original);
+        var baseName = folderName + "_" + stem;
+
+        if (cfg.AppendDateToFileName)
+        {
+            var fmt = string.IsNullOrWhiteSpace(cfg.FileNameDateFormat) ? "yyyyMMdd" : cfg.FileNameDateFormat.Trim();
+            string datePart;
+            try { datePart = DateTime.Now.ToString(fmt); }
+            catch { datePart = DateTime.Now.ToString("yyyyMMdd"); }
+            if (!baseName.EndsWith("_" + datePart, StringComparison.OrdinalIgnoreCase))
+                baseName = baseName + "_" + datePart;
+        }
+
+        return baseName + ext;
     }
 
     private bool TryCopyOne(
